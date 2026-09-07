@@ -5,40 +5,18 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import xgboost as xgb
-from sklearn.model_selection import StratifiedKFold
 
 import config
 from utils import setup_logger, set_seed, calculate_tss
 from models.cnn_lstm_model import SolarFlareCNNLSTM
-from data_loader import extract_ml_features
+from data_loader import extract_ml_features, load_train_test_partitions
 
 logger = setup_logger("EnsemblePipeline")
 
 
 def load_data():
-    """Loads dataset partitions or synthesizes SWANSF arrays."""
-    search_dirs = [config.DATA_DIR, "."]
-    X_p, y_p = None, None
-
-    for d in search_dirs:
-        tr_x = glob.glob(os.path.join(d, "*X_train*.pkl")) + [f for f in glob.glob(os.path.join(d, "train", "*Partition1*.pkl")) if "Labels" not in f]
-        tr_y = glob.glob(os.path.join(d, "*y_train*.pkl")) + glob.glob(os.path.join(d, "train", "*Partition1_Labels*.pkl"))
-        if tr_x and tr_y:
-            X_p, y_p = tr_x[0], tr_y[0]
-            break
-
-    if X_p and y_p:
-        with open(X_p, "rb") as f: X = pickle.load(f)
-        with open(y_p, "rb") as f: y = pickle.load(f)
-    else:
-        logger.warning("Partition files not found. Generating synthetic array for benchmarking.")
-        X = np.random.randn(5000, 60, 24).astype(np.float32)
-        y = np.random.choice([0, 1, 2, 3], size=(5000,), p=[0.70, 0.18, 0.09, 0.03])
-
-    if isinstance(X, dict): X = X[list(X.keys())[0]]
-    if isinstance(y, dict): y = y[list(y.keys())[0]]
-
-    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64).squeeze()
+    """Load all training partitions and their separate untouched test partitions."""
+    return load_train_test_partitions()
 
 def predict_dl_model(model, X, batch_size=64):
     """Generates probability predictions using PyTorch model on GPU."""
@@ -64,17 +42,11 @@ def run_ensemble_pipeline():
     set_seed(42)
     logger.info("⚡ Starting GPU-Accelerated PyTorch + XGBoost Ensemble")
     
-    X, y = load_data()
+    X_train, y_train, X_test, y_test = load_data()
     
     # Extract 2D statistical features for XGBoost: (N, 120 features)
-    X_xgb_features = extract_ml_features(X)
-    
-    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-    train_idx, test_idx = next(skf.split(X, y))
-    
-    X_train_dl, X_test_dl = X[train_idx], X[test_idx]
-    X_train_xgb, X_test_xgb = X_xgb_features[train_idx], X_xgb_features[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
+    X_train_xgb = extract_ml_features(X_train)
+    X_test_xgb = extract_ml_features(X_test)
 
     # 1. Load Trained PyTorch Checkpoint
     checkpoint_path = os.path.join(config.MODEL_SAVE_DIR, "best_solar_flare_model.pt")
@@ -84,16 +56,25 @@ def run_ensemble_pipeline():
         dl_model.load_state_dict(torch.load(checkpoint_path, map_location=config.DEVICE))
         logger.info(f"Loaded PyTorch checkpoint: {checkpoint_path}")
     else:
-        logger.warning("No checkpoint found. Evaluating with initialized architecture.")
+        raise FileNotFoundError(
+            f"DL checkpoint is required for ensemble evaluation: {checkpoint_path}"
+        )
 
     logger.info("Computing Deep Learning probabilities...")
-    dl_probs = predict_dl_model(dl_model, X_test_dl)
+    dl_probs = predict_dl_model(dl_model, X_test)
 
     # 2. Train XGBoost Model on RTX GPU
     logger.info("Training XGBoost Classifier on GPU...")
     xgb_clf = xgb.XGBClassifier(**config.ML_CONFIG)
     xgb_clf.fit(X_train_xgb, y_train)
-    xgb_probs = xgb_clf.predict_proba(X_test_xgb)
+    # X_test_xgb is a NumPy array on CPU.  Predict on CPU to avoid XGBoost's
+    # CUDA DMatrix fallback warning, then restore the configured device.
+    prediction_device = xgb_clf.get_params().get("device", "cpu")
+    try:
+        xgb_clf.set_params(device="cpu")
+        xgb_probs = xgb_clf.predict_proba(X_test_xgb)
+    finally:
+        xgb_clf.set_params(device=prediction_device)
 
     # 3. Fixed Equal-Weight Blending
     # LEAKAGE FIX: The previous grid-search over w used y_test to pick the best weight,
@@ -117,7 +98,11 @@ def run_ensemble_pipeline():
     logger.info("="*80)
     logger.info(f"Optimal Blending Weight : {best_weight:.2f} DL + {1.0 - best_weight:.2f} XGB")
     logger.info("-" * 80)
-    if config.NUM_CLASSES == 3:
+    if config.NUM_CLASSES == 2:
+        logger.info(f"PyTorch DL Mean TSS     : {np.mean(list(dl_tss.values())):.4f} | (Flare: {dl_tss.get(1, 0.0):.4f})")
+        logger.info(f"XGBoost GPU Mean TSS    : {np.mean(list(xgb_tss.values())):.4f} | (Flare: {xgb_tss.get(1, 0.0):.4f})")
+        logger.info(f"Ensemble Mean TSS       : {np.mean(list(ens_tss.values())):.4f} | (Flare: {ens_tss.get(1, 0.0):.4f})")
+    elif config.NUM_CLASSES == 3:
         logger.info(f"PyTorch DL Mean TSS     : {np.mean(list(dl_tss.values())):.4f} | (M: {dl_tss[1]:.4f}, X: {dl_tss[2]:.4f})")
         logger.info(f"XGBoost GPU Mean TSS    : {np.mean(list(xgb_tss.values())):.4f} | (M: {xgb_tss[1]:.4f}, X: {xgb_tss[2]:.4f})")
         logger.info(f"🏆 ENSEMBLE MEAN TSS    : {np.mean(list(ens_tss.values())):.4f} | (M: {ens_tss[1]:.4f}, X: {ens_tss[2]:.4f})")

@@ -1,5 +1,7 @@
 import os
 import pickle
+import glob
+import re
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -67,6 +69,49 @@ def load_pickle_file(file_path):
     with open(file_path, "rb") as f:
         data = pickle.load(f)
     return data
+
+def _partition_number(file_path):
+    match = re.search(r"Partition(\d+)", os.path.basename(file_path))
+    if not match:
+        raise ValueError(f"Could not identify partition number in: {file_path}")
+    return int(match.group(1))
+
+def _unwrap_partition(data):
+    if isinstance(data, dict):
+        if len(data) != 1:
+            raise ValueError("Partition dictionaries must contain exactly one array.")
+        return next(iter(data.values()))
+    return data
+
+def _load_split_partitions(split_name, data_dir=config.DATA_DIR):
+    """Load and concatenate every feature/label partition for one split."""
+    split_dir = os.path.join(data_dir, split_name)
+    files = glob.glob(os.path.join(split_dir, "*.pkl"))
+    feature_files = { _partition_number(path): path for path in files if "Labels" not in os.path.basename(path) }
+    label_files = { _partition_number(path): path for path in files if "Labels" in os.path.basename(path) }
+
+    partition_ids = sorted(feature_files)
+    if not partition_ids or set(partition_ids) != set(label_files):
+        raise FileNotFoundError(f"Feature/label partition pairs are incomplete in: {split_dir}")
+
+    features, labels = [], []
+    for partition_id in partition_ids:
+        X = np.asarray(_unwrap_partition(load_pickle_file(feature_files[partition_id])), dtype=np.float32)
+        y = np.asarray(_unwrap_partition(load_pickle_file(label_files[partition_id])), dtype=np.int64).squeeze()
+        if X.ndim != 3 or X.shape[1:] != (config.SEQ_LEN, config.NUM_FEATURES):
+            raise ValueError(f"Unexpected feature shape in partition {partition_id}: {X.shape}")
+        if len(X) != len(y):
+            raise ValueError(f"Feature/label count mismatch in partition {partition_id}.")
+        features.append(X)
+        labels.append(y)
+
+    return np.concatenate(features, axis=0), np.concatenate(labels, axis=0)
+
+def load_train_test_partitions(data_dir=config.DATA_DIR):
+    """Return all training partitions and all untouched test partitions."""
+    X_train, y_train = _load_split_partitions("train", data_dir)
+    X_test, y_test = _load_split_partitions("test", data_dir)
+    return X_train, y_train, X_test, y_test
 
 def prepare_dataloaders(X_train, y_train, X_test, y_test, batch_size=config.DL_CONFIG["batch_size"]):
     """

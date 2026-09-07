@@ -6,7 +6,7 @@ from sklearn.metrics import classification_report, accuracy_score
 from sklearn.model_selection import train_test_split
 import config
 from utils import setup_logger, set_seed, verify_hardware_acceleration
-from data_loader import extract_ml_features
+from data_loader import extract_ml_features, load_train_test_partitions
 from models.xgboost_model import SolarXGBoost
 from presentation import SolarPresentationEngine
 
@@ -45,36 +45,8 @@ def run_ml_pipeline():
 
     logger.info("Starting Machine Learning (XGBoost) Pipeline Execution...")
 
-    # 1. Locate and Load Dataset Partitions
-    X_train_p, y_train_p, X_test_p, y_test_p = find_partition_files(config.DATA_DIR)
-
-    if X_train_p and y_train_p and X_test_p and y_test_p:
-        logger.info(f"Loading Train Data from: {X_train_p}")
-        with open(X_train_p, "rb") as f:
-            X_train = pickle.load(f)
-        with open(y_train_p, "rb") as f:
-            y_train = pickle.load(f)
-
-        logger.info(f"Loading Test Data from: {X_test_p}")
-        with open(X_test_p, "rb") as f:
-            X_test = pickle.load(f)
-        with open(y_test_p, "rb") as f:
-            y_test = pickle.load(f)
-    else:
-        logger.warning("Partition files not found directly. Generating synthetic SWANSF array for demonstration.")
-        X_train = np.random.randn(2000, 60, 24).astype(np.float32)
-        y_train = np.random.randint(0, 4, size=(2000,))
-        X_test = np.random.randn(500, 60, 24).astype(np.float32)
-        y_test = np.random.randint(0, 4, size=(500,))
-
-    # Handle dictionary partitions if pickled as dicts
-    if isinstance(X_train, dict):
-        first_key = list(X_train.keys())[0]
-        logger.info(f"Unpacking dictionary partition using key '{first_key}'...")
-        X_train = X_train[first_key]
-        y_train = y_train[first_key]
-        X_test = X_test[list(X_test.keys())[0]]
-        y_test = y_test[list(y_test.keys())[0]]
+    # 1. Load every training partition and every untouched test partition.
+    X_train, y_train, X_test, y_test = load_train_test_partitions()
 
     # Ensure y values are 1D arrays
     y_train = np.array(y_train).squeeze()
@@ -86,18 +58,11 @@ def run_ml_pipeline():
     X_train_2d = extract_ml_features(X_train)
     X_test_2d = extract_ml_features(X_test)
 
-    # 3. Initialize and Train GPU XGBoost
-    # LEAKAGE FIX: Create an internal 20% validation split from TRAINING data only.
-    # The held-out test set (X_test_2d / y_test) must NEVER appear inside fit().
-    X_tr_xgb, X_val_xgb, y_tr_xgb, y_val_xgb = train_test_split(
-        X_train_2d, y_train,
-        test_size=0.20,
-        stratify=y_train,
-        random_state=42
-    )
+    # 3. Train on every training partition. The test partitions are never passed
+    # to fit(), so their score remains an untouched generalization estimate.
     xgb_classifier = SolarXGBoost()
     xgb_classifier.build_model()
-    xgb_classifier.train(X_tr_xgb, y_tr_xgb, eval_set=[(X_val_xgb, y_val_xgb)])
+    xgb_classifier.train(X_train_2d, y_train)
 
     # 4. Model Evaluation
     test_probs = xgb_classifier.predict_proba(X_test_2d)
@@ -111,7 +76,12 @@ def run_ml_pipeline():
 
     acc = accuracy_score(y_test, test_preds)
     logger.info(f"XGBoost Test Accuracy: {acc * 100:.2f}%")
-    if config.NUM_CLASSES == 3:
+    if config.NUM_CLASSES == 2:
+        logger.info("\nClassification Report:\n" + classification_report(
+            y_test, test_preds, labels=[0, 1],
+            target_names=["Quiet", "M/X-Class Flare"], zero_division=0
+        ))
+    elif config.NUM_CLASSES == 3:
         logger.info("\nClassification Report:\n" + classification_report(y_test, test_preds, labels=[0, 1, 2], target_names=["Quiet", "M-Class", "X-Class"]))
     else:
         logger.info("\nClassification Report:\n" + classification_report(y_test, test_preds, labels=[0, 1, 2, 3], target_names=["Quiet", "C-Class", "M-Class", "X-Class"]))

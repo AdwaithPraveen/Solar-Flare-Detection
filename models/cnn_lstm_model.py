@@ -58,10 +58,12 @@ class SolarFlareCNNLSTM(nn.Module):
             nn.Conv1d(num_features, cnn_out_channels, kernel_size, padding=kernel_size // 2),
             nn.BatchNorm1d(cnn_out_channels),
             nn.SiLU(),
+            nn.Dropout(0.2),
             nn.Conv1d(cnn_out_channels, cnn_out_channels, kernel_size, padding=kernel_size // 2),
             nn.BatchNorm1d(cnn_out_channels),
             nn.SiLU(),
-            nn.MaxPool1d(kernel_size=2)
+            nn.MaxPool1d(kernel_size=2),
+            nn.Dropout(0.3)
         )
 
         # Deep Recurrent Encoder

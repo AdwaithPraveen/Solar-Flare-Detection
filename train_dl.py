@@ -13,6 +13,7 @@ import config
 from utils import setup_logger, set_seed, calculate_tss
 from models.cnn_lstm_model import SolarFlareCNNLSTM, CNNLSTMTrainer
 from presentation import SolarPresentationEngine
+from data_loader import load_train_test_partitions
 
 logger = setup_logger("TrainDL_KFold")
 
@@ -48,37 +49,8 @@ def create_gpu_dataloader(X, y, batch_size, shuffle=True):
     )
 
 def load_swansf_data():
-    """Locates and loads SWANSF dataset partitions or fallback arrays."""
-    search_dirs = [config.DATA_DIR, "."]
-    X_p, y_p = None, None
-
-    for d in search_dirs:
-        tr_x = glob.glob(os.path.join(d, "*X_train*.pkl")) + [f for f in glob.glob(os.path.join(d, "train", "*Partition1*.pkl")) if "Labels" not in f]
-        tr_y = glob.glob(os.path.join(d, "*y_train*.pkl")) + glob.glob(os.path.join(d, "train", "*Partition1_Labels*.pkl"))
-        if tr_x and tr_y:
-            X_p, y_p = tr_x[0], tr_y[0]
-            break
-
-    if X_p and y_p:
-        logger.info(f"Loading partitions: {os.path.basename(X_p)} | {os.path.basename(y_p)}")
-        with open(X_p, "rb") as f: X = pickle.load(f)
-        with open(y_p, "rb") as f: y = pickle.load(f)
-    else:
-        logger.warning("No partition files found. Synthesizing 5,000 SWANSF sequences for benchmarking.")
-        X = np.random.randn(5000, 60, 24).astype(np.float32)
-        y = np.random.choice([0, 1], size=(5000,), p=[0.85, 0.15])
-
-    if isinstance(X, dict): X = X[list(X.keys())[0]]
-    if isinstance(y, dict): y = y[list(y.keys())[0]]
-
-    X_arr = np.array(X, dtype=np.float32)
-    y_arr = np.array(y, dtype=np.int64).squeeze()
-
-    # Target Leakage Verification
-    assert X_arr.shape[-1] == config.NUM_FEATURES, f"Data shape mismatch: Expected {config.NUM_FEATURES} features, got {X_arr.shape[-1]}"
-    assert len(X_arr) == len(y_arr), f"Feature length {len(X_arr)} != Target length {len(y_arr)}"
-
-    return X_arr, y_arr
+    """Load all training partitions and the separate untouched test partitions."""
+    return load_train_test_partitions()
 
 def run_stratified_kfold_pipeline(n_splits=5, epochs_per_fold=None):
     if epochs_per_fold is None:
@@ -90,10 +62,10 @@ def run_stratified_kfold_pipeline(n_splits=5, epochs_per_fold=None):
     set_seed(42)
 
     logger.info("=========================================================")
-    logger.info(f"STARTING {n_splits}-FOLD STRATIFIED CV")
+    logger.info(f"STARTING {n_splits}-FOLD INTERNAL STRATIFIED CV")
     logger.info("=========================================================")
 
-    X, y = load_swansf_data()
+    X, y, X_test, y_test = load_swansf_data()
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     
     fold_tss_scores = []
@@ -170,14 +142,14 @@ def run_stratified_kfold_pipeline(n_splits=5, epochs_per_fold=None):
 
     # Aggregated CV Benchmark Report
     logger.info("\n" + "="*80)
-    logger.info("            FINAL STRATIFIED K-FOLD CV BENCHMARK REPORT           ")
+    logger.info(" INTERNAL CV REPORT (TRAINING PARTITIONS ONLY; NOT TEST PERFORMANCE) ")
     logger.info("="*80)
     
     mean_cv_acc = np.mean(fold_accuracies) * 100.0
     overall_mean_tss = np.mean([np.mean(list(f.values())) for f in fold_tss_scores])
     avg_q_tss = np.mean([f[0] for f in fold_tss_scores])
 
-    logger.info(f"Mean Validation Accuracy: {mean_cv_acc:.2f}%")
+    logger.info(f"Mean Internal CV Accuracy: {mean_cv_acc:.2f}%")
     logger.info(f"Quiet Class TSS         : {avg_q_tss:.4f}")
     if config.NUM_CLASSES == 2:
         avg_flare_tss = np.mean([f.get(1, 0.0) for f in fold_tss_scores])
@@ -195,10 +167,29 @@ def run_stratified_kfold_pipeline(n_splits=5, epochs_per_fold=None):
         logger.info(f"M-Class Flare TSS       : {avg_m_tss:.4f}")
         logger.info(f"X-Class Flare TSS       : {avg_x_tss:.4f}")
         
-    logger.info(f"🎯 OVERALL MEAN TSS ACROSS ALL FOLDS: {overall_mean_tss:.4f}")
+    logger.info(f"Overall Internal CV Mean TSS: {overall_mean_tss:.4f}")
     logger.info("="*80)
-    
-    return dl_probs
+
+    checkpoint_path = os.path.join(config.MODEL_SAVE_DIR, "best_solar_flare_model.pt")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Best DL checkpoint was not created: {checkpoint_path}")
+
+    best_model = SolarFlareCNNLSTM(num_classes=config.NUM_CLASSES)
+    best_model.load_state_dict(torch.load(checkpoint_path, map_location=config.DEVICE))
+    test_loader = create_gpu_dataloader(X_test, y_test, config.DL_CONFIG["batch_size"], shuffle=False)
+    test_trainer = CNNLSTMTrainer(best_model, device=config.DEVICE)
+    test_loss, test_acc, test_preds, test_targets, test_probs = test_trainer.evaluate(test_loader)
+    if not np.array_equal(test_targets, y_test):
+        raise RuntimeError("Held-out test targets do not match the test partition order.")
+
+    test_tss = calculate_tss(y_test, test_preds)
+    logger.info("\n" + "=" * 80)
+    logger.info("HELD-OUT TEST REPORT")
+    logger.info(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc * 100:.2f}%")
+    logger.info(f"Test Mean TSS: {np.mean(list(test_tss.values())):.4f} | Flare TSS: {test_tss.get(1, 0.0):.4f}")
+    logger.info("=" * 80)
+
+    return test_probs
 
 if __name__ == "__main__":
     run_stratified_kfold_pipeline(n_splits=5, epochs_per_fold=config.DL_CONFIG.get("epochs", 60))

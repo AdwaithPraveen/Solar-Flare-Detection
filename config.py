@@ -30,12 +30,12 @@ DL_CONFIG: Dict[str, Any] = {
     "weight_decay": 1e-3,        # L2 Regularization to stop overfitting
     
     # Scaled Neural Architecture
-    "cnn_out_channels": 128,     # Spatial conv filters
+    "cnn_out_channels": 64,      # Spatial conv filters
     "cnn_kernel_size": 5,        # Broader time window kernel
-    "lstm_hidden_size": 256,     # Recurrent capacity
+    "lstm_hidden_size": 128,     # Recurrent capacity
     "lstm_layers": 2,            # 2-layer deep stack with dropout
-    "lstm_dropout": 0.3,
-    "fc_hidden": 128
+    "lstm_dropout": 0.5,
+    "fc_hidden": 64
 }
 
 # ==========================================
