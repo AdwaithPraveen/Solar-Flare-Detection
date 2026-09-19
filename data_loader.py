@@ -83,25 +83,53 @@ def _unwrap_partition(data):
         return next(iter(data.values()))
     return data
 
-def _load_split_partitions(split_name, data_dir=config.DATA_DIR):
-    """Load and concatenate every feature/label partition for one split."""
+def _split_partition_files(split_name, data_dir=config.DATA_DIR):
+    """Return feature and label files indexed by partition number."""
     split_dir = os.path.join(data_dir, split_name)
     files = glob.glob(os.path.join(split_dir, "*.pkl"))
     feature_files = { _partition_number(path): path for path in files if "Labels" not in os.path.basename(path) }
     label_files = { _partition_number(path): path for path in files if "Labels" in os.path.basename(path) }
-
-    partition_ids = sorted(feature_files)
-    if not partition_ids or set(partition_ids) != set(label_files):
+    if not feature_files or set(feature_files) != set(label_files):
         raise FileNotFoundError(f"Feature/label partition pairs are incomplete in: {split_dir}")
+    return feature_files, label_files
+
+def available_partition_ids(data_dir=config.DATA_DIR):
+    """Return partition IDs that have complete train and test pairs."""
+    train_features, train_labels = _split_partition_files("train", data_dir)
+    test_features, test_labels = _split_partition_files("test", data_dir)
+    partition_ids = sorted(set(train_features) & set(train_labels) & set(test_features) & set(test_labels))
+    if not partition_ids:
+        raise FileNotFoundError("No complete train/test partition pairs were found.")
+    return partition_ids
+
+def _load_partition(feature_path, label_path, partition_id):
+    X = np.asarray(_unwrap_partition(load_pickle_file(feature_path)), dtype=np.float32)
+    y = np.asarray(_unwrap_partition(load_pickle_file(label_path)), dtype=np.int64).squeeze()
+    if X.ndim != 3 or X.shape[1:] != (config.SEQ_LEN, config.NUM_FEATURES):
+        raise ValueError(f"Unexpected feature shape in partition {partition_id}: {X.shape}")
+    if len(X) != len(y):
+        raise ValueError(f"Feature/label count mismatch in partition {partition_id}.")
+    return X, y
+
+def load_partition_pair(partition_id, data_dir=config.DATA_DIR):
+    """Load one matching train/test pair without mixing it with other partitions."""
+    train_features, train_labels = _split_partition_files("train", data_dir)
+    test_features, test_labels = _split_partition_files("test", data_dir)
+    if partition_id not in train_features or partition_id not in test_features:
+        raise FileNotFoundError(f"Partition {partition_id} is not available in both train and test splits.")
+
+    X_train, y_train = _load_partition(train_features[partition_id], train_labels[partition_id], partition_id)
+    X_test, y_test = _load_partition(test_features[partition_id], test_labels[partition_id], partition_id)
+    return X_train, y_train, X_test, y_test
+
+def _load_split_partitions(split_name, data_dir=config.DATA_DIR):
+    """Load and concatenate every feature/label partition for one split."""
+    feature_files, label_files = _split_partition_files(split_name, data_dir)
+    partition_ids = sorted(feature_files)
 
     features, labels = [], []
     for partition_id in partition_ids:
-        X = np.asarray(_unwrap_partition(load_pickle_file(feature_files[partition_id])), dtype=np.float32)
-        y = np.asarray(_unwrap_partition(load_pickle_file(label_files[partition_id])), dtype=np.int64).squeeze()
-        if X.ndim != 3 or X.shape[1:] != (config.SEQ_LEN, config.NUM_FEATURES):
-            raise ValueError(f"Unexpected feature shape in partition {partition_id}: {X.shape}")
-        if len(X) != len(y):
-            raise ValueError(f"Feature/label count mismatch in partition {partition_id}.")
+        X, y = _load_partition(feature_files[partition_id], label_files[partition_id], partition_id)
         features.append(X)
         labels.append(y)
 
@@ -112,6 +140,10 @@ def load_train_test_partitions(data_dir=config.DATA_DIR):
     X_train, y_train = _load_split_partitions("train", data_dir)
     X_test, y_test = _load_split_partitions("test", data_dir)
     return X_train, y_train, X_test, y_test
+
+def load_all_training_partitions(data_dir=config.DATA_DIR):
+    """Return every training partition for fitting a final deployment model."""
+    return _load_split_partitions("train", data_dir)
 
 def prepare_dataloaders(X_train, y_train, X_test, y_test, batch_size=config.DL_CONFIG["batch_size"]):
     """

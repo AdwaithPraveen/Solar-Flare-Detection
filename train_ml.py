@@ -1,105 +1,107 @@
-import os
-import pickle
-import glob
+﻿import os
 import numpy as np
 from sklearn.metrics import classification_report, accuracy_score
-from sklearn.model_selection import train_test_split
 import config
-from utils import setup_logger, set_seed, verify_hardware_acceleration
-from data_loader import extract_ml_features, load_train_test_partitions
+from utils import setup_logger, set_seed, verify_hardware_acceleration, calculate_tss, calculate_all_metrics
+from data_loader import (
+    available_partition_ids,
+    extract_ml_features,
+    load_all_training_partitions,
+    load_partition_pair,
+)
 from models.xgboost_model import SolarXGBoost
 from presentation import SolarPresentationEngine
 
 logger = setup_logger("TrainML")
 
-def find_partition_files(data_dir):
-    """
-    Locates SWANSF train/test pickle files or falls back to partition search.
-    """
-    # Look in data_dir and current working directory
-    search_dirs = [data_dir, "."]
-    
-    X_train_path, y_train_path = None, None
-    X_test_path, y_test_path = None, None
+def print_detailed_evaluation(partition_id, model_name, metrics):
+    cm = metrics["confusion_matrix"]
+    raw_acc = metrics["raw_accuracy"] * 100.0
+    bal_acc = metrics["balanced_accuracy"] * 100.0
+    tss_flare = metrics["tss"].get(1, 0.0)
+    hss = metrics["hss"]
+    rec_flare = metrics["recall"].get(1, 0.0) * 100.0
+    spec_quiet = metrics["specificity"].get(0, 0.0) * 100.0
+    prec_flare = metrics["precision"].get(1, 0.0) * 100.0
+    f1_flare = metrics["f1"].get(1, 0.0)
 
-    for d in search_dirs:
-        # Check standard partition names
-        train_x_matches = glob.glob(os.path.join(d, "*X_train*.pkl")) + [f for f in glob.glob(os.path.join(d, "train", "*Partition1*.pkl")) if "Labels" not in f]
-        train_y_matches = glob.glob(os.path.join(d, "*y_train*.pkl")) + glob.glob(os.path.join(d, "train", "*Partition1_Labels*.pkl"))
-        
-        test_x_matches = glob.glob(os.path.join(d, "*X_test*.pkl")) + [f for f in glob.glob(os.path.join(d, "test", "*Partition2*.pkl")) if "Labels" not in f]
-        test_y_matches = glob.glob(os.path.join(d, "*y_test*.pkl")) + glob.glob(os.path.join(d, "test", "*Partition2_Labels*.pkl"))
-
-        if train_x_matches and train_y_matches:
-            X_train_path = train_x_matches[0]
-            y_train_path = train_y_matches[0]
-        if test_x_matches and test_y_matches:
-            X_test_path = test_x_matches[0]
-            y_test_path = test_y_matches[0]
-
-    return X_train_path, y_train_path, X_test_path, y_test_path
+    part_str = f"Partition {partition_id}" if partition_id is not None else "Final Deployment Model"
+    logger.info("-" * 78)
+    logger.info(f"  DETAILED METRICS: {model_name} on {part_str}")
+    logger.info("-" * 78)
+    logger.info(f"  * Raw Accuracy       : {raw_acc:6.2f}%  (Reflects class imbalance: ~99% Quiet)")
+    logger.info(f"  * Balanced Accuracy  : {bal_acc:6.2f}%  (Macro-averaged recall across classes)")
+    logger.info(f"  * Flare TSS          : {tss_flare:6.4f}   (True Skill Statistic = TPR - FPR)")
+    logger.info(f"  * Heidke Skill Score : {hss:6.4f}   (HSS skill relative to random chance)")
+    logger.info(f"  * Flare Recall (TPR) : {rec_flare:6.2f}%  (Detection rate of actual flares)")
+    logger.info(f"  * Quiet Specificity  : {spec_quiet:6.2f}%  (Correct identification of non-flares)")
+    logger.info(f"  * Flare Precision    : {prec_flare:6.2f}%")
+    logger.info(f"  * Flare F1-Score     : {f1_flare:6.4f}")
+    if "roc_auc" in metrics:
+        logger.info(f"  * ROC-AUC Score      : {metrics['roc_auc']:6.4f}")
+    if "pr_auc" in metrics:
+        logger.info(f"  * PR-AUC Score       : {metrics['pr_auc']:6.4f}")
+    tn, fp = cm[0,0], cm[0,1]
+    fn, tp = cm[1,0], cm[1,1]
+    logger.info(f"  * Confusion Matrix   : TN={tn}, FP={fp} | FN={fn}, TP={tp}")
+    logger.info("-" * 78)
 
 def run_ml_pipeline():
     set_seed(42)
     verify_hardware_acceleration(logger)
+    logger.info("Starting XGBoost evaluation across matched train/test partitions...")
 
-    logger.info("Starting Machine Learning (XGBoost) Pipeline Execution...")
+    results = []
+    for partition_id in available_partition_ids():
+        X_train, y_train, X_test, y_test = load_partition_pair(partition_id)
+        logger.info(f"Partition {partition_id}: Train {X_train.shape}, Test {X_test.shape}")
 
-    # 1. Load every training partition and every untouched test partition.
-    X_train, y_train, X_test, y_test = load_train_test_partitions()
+        X_train_2d = extract_ml_features(X_train)
+        X_test_2d = extract_ml_features(X_test)
 
-    # Ensure y values are 1D arrays
-    y_train = np.array(y_train).squeeze()
-    y_test = np.array(y_test).squeeze()
+        xgb_classifier = SolarXGBoost()
+        xgb_classifier.build_model()
+        xgb_classifier.train(X_train_2d, y_train)
+        test_probs = xgb_classifier.predict_proba(X_test_2d)
+        if config.NUM_CLASSES == 2 and test_probs.ndim == 1:
+            test_probs = np.column_stack([1.0 - test_probs, test_probs])
 
-    logger.info(f"Data Loaded successfully -> Train: {X_train.shape}, Test: {X_test.shape}")
+        threshold = getattr(config, "OPERATIONAL_THRESHOLD", 0.5)
+        if config.NUM_CLASSES == 2:
+            test_preds = (test_probs[:, 1] >= threshold).astype(int)
+        else:
+            test_preds = np.argmax(test_probs, axis=1)
 
-    # 2. Extract 2D Statistical Features
+        metrics = calculate_all_metrics(y_test, test_preds, y_probs=test_probs)
+        print_detailed_evaluation(partition_id, "XGBoost", metrics)
+
+        xgb_classifier.save_model(f"xgboost_partition_{partition_id}.joblib")
+        results.append({"partition_id": partition_id, "metrics": metrics})
+
+    mean_raw_acc = np.mean([r['metrics']['raw_accuracy'] for r in results]) * 100.0
+    mean_bal_acc = np.mean([r['metrics']['balanced_accuracy'] for r in results]) * 100.0
+    mean_tss = np.mean([r['metrics']['tss'].get(1, 0.0) for r in results])
+    mean_hss = np.mean([r['metrics']['hss'] for r in results])
+
+    logger.info("=" * 78)
+    logger.info("XGBoost SUMMARY ACROSS ALL PARTITIONS:")
+    logger.info(f"  Mean Raw Accuracy      : {mean_raw_acc:.2f}%")
+    logger.info(f"  Mean Balanced Accuracy : {mean_bal_acc:.2f}%")
+    logger.info(f"  Mean Flare TSS         : {mean_tss:.4f}")
+    logger.info(f"  Mean Heidke Skill Score: {mean_hss:.4f}")
+    logger.info("=" * 78)
+    return results
+
+def train_final_ml_model():
+    """Fit one deployment XGBoost model on all training partitions."""
+    X_train, y_train = load_all_training_partitions()
     X_train_2d = extract_ml_features(X_train)
-    X_test_2d = extract_ml_features(X_test)
-
-    # 3. Train on every training partition. The test partitions are never passed
-    # to fit(), so their score remains an untouched generalization estimate.
-    xgb_classifier = SolarXGBoost()
-    xgb_classifier.build_model()
-    xgb_classifier.train(X_train_2d, y_train)
-
-    # 4. Model Evaluation
-    test_probs = xgb_classifier.predict_proba(X_test_2d)
-
-    # XGBoost with binary:logistic returns shape (N,) — a single P(class=1) per sample.
-    # Reshape to (N, 2) = [P(class=0), P(class=1)] so all downstream code is uniform.
-    if config.NUM_CLASSES == 2 and test_probs.ndim == 1:
-        test_probs = np.column_stack([1.0 - test_probs, test_probs])
-
-    test_preds = np.argmax(test_probs, axis=1)
-
-    acc = accuracy_score(y_test, test_preds)
-    logger.info(f"XGBoost Test Accuracy: {acc * 100:.2f}%")
-    if config.NUM_CLASSES == 2:
-        logger.info("\nClassification Report:\n" + classification_report(
-            y_test, test_preds, labels=[0, 1],
-            target_names=["Quiet", "M/X-Class Flare"], zero_division=0
-        ))
-    elif config.NUM_CLASSES == 3:
-        logger.info("\nClassification Report:\n" + classification_report(y_test, test_preds, labels=[0, 1, 2], target_names=["Quiet", "M-Class", "X-Class"]))
-    else:
-        logger.info("\nClassification Report:\n" + classification_report(y_test, test_preds, labels=[0, 1, 2, 3], target_names=["Quiet", "C-Class", "M-Class", "X-Class"]))
-
-    # 5. Save Model
-    xgb_classifier.save_model("xgboost_solar_flare.joblib")
-
-    # 6. Generate Human-Readable Presentation Reports for top samples
-    engine = SolarPresentationEngine()
-    print("\n" + "="*80)
-    print("       SAMPLE PRESENTATION REPORTS GENERATED BY XGBOOST PIPELINE")
-    print("="*80)
-    
-    for idx in range(min(3, len(X_test))):
-        report = engine.format_single_report(idx, test_probs[idx], model_name="XGBoost (GPU Accelerated)")
-        print(report)
-
-    return test_probs
+    classifier = SolarXGBoost()
+    classifier.build_model()
+    classifier.train(X_train_2d, y_train)
+    classifier.save_model("xgboost_final.joblib")
+    logger.info("Saved final XGBoost deployment model.")
+    return classifier
 
 if __name__ == "__main__":
     run_ml_pipeline()

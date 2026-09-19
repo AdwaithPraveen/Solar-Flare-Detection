@@ -1,11 +1,11 @@
-import os
+﻿import os
 import torch
 from typing import Dict, Any
 
 # ==========================================
 # 1. DIRECTORY & DATA CONFIGURATION
 # ==========================================
-DATA_DIR = "./Cleaned SWANSF Dataset/Cleaned SWANSF Dataset" # Path discovered from load_data.ipynb
+DATA_DIR = "./Cleaned SWANSF Dataset/Cleaned SWANSF Dataset"
 MODEL_SAVE_DIR = "./saved_models"
 
 os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
@@ -13,6 +13,7 @@ os.makedirs(MODEL_SAVE_DIR, exist_ok=True)
 SEQ_LEN = 60
 NUM_FEATURES = 24
 NUM_CLASSES = 2                  # (0: Quiet, 1: Flare [M/X-Class] in SWANSF WithoutC dataset)
+OPERATIONAL_THRESHOLD = 0.5      # Decision threshold for Class 1 (Flare)
 
 # ==========================================
 # 2. HARDWARE CONFIGURATION
@@ -25,7 +26,7 @@ USE_AMP = True                   # Automatic Mixed Precision for RTX Tensor Core
 # ==========================================
 DL_CONFIG: Dict[str, Any] = {
     "batch_size": 64,            # Batch size
-    "epochs": 60,                # Training window
+    "epochs": 40,                # Training window
     "learning_rate": 3e-4,       # Optimal starting rate for AdamW
     "weight_decay": 1e-3,        # L2 Regularization to stop overfitting
     
@@ -42,11 +43,13 @@ DL_CONFIG: Dict[str, Any] = {
 # 4. HIGH-CAPACITY MACHINE LEARNING (XGBOOST)
 # ==========================================
 ML_CONFIG: Dict[str, Any] = {
-    "n_estimators": 500,         # Decision trees
-    "learning_rate": 0.03,       # Fine-grained boosting steps
-    "max_depth": 6,              # Tree depth
+    "n_estimators": 300,         # Decision trees
+    "learning_rate": 0.05,       # Fine-grained boosting steps
+    "max_depth": 5,              # Controlled tree depth to prevent over-memorization
     "subsample": 0.8,
     "colsample_bytree": 0.8,
+    "min_child_weight": 3,       # Regularize leaf node complexity
+    "gamma": 0.1,                # Minimum loss reduction for split
     "objective": "binary:logistic" if NUM_CLASSES == 2 else "multi:softprob",
     "eval_metric": "logloss" if NUM_CLASSES == 2 else "mlogloss",
     "tree_method": "hist",

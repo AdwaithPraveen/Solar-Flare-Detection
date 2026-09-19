@@ -50,17 +50,18 @@ class SolarFlareCNNLSTM(nn.Module):
     ):
         super(SolarFlareCNNLSTM, self).__init__()
 
-        # Input Normalization Layer (Fixes unscaled physical features)
-        self.input_bn = nn.BatchNorm1d(num_features)
+        # Group normalization avoids relying on running batch statistics from
+        # the resampled training distribution at inference time.
+        self.input_norm = nn.GroupNorm(1, num_features)
 
         # Spatial Feature Extractor
         self.conv_block = nn.Sequential(
             nn.Conv1d(num_features, cnn_out_channels, kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm1d(cnn_out_channels),
+            nn.GroupNorm(8, cnn_out_channels),
             nn.SiLU(),
             nn.Dropout(0.2),
             nn.Conv1d(cnn_out_channels, cnn_out_channels, kernel_size, padding=kernel_size // 2),
-            nn.BatchNorm1d(cnn_out_channels),
+            nn.GroupNorm(8, cnn_out_channels),
             nn.SiLU(),
             nn.MaxPool1d(kernel_size=2),
             nn.Dropout(0.3)
@@ -80,10 +81,19 @@ class SolarFlareCNNLSTM(nn.Module):
         bidirectional_dim = lstm_hidden_size * 2
         self.attention = TemporalAttention(bidirectional_dim)
 
+        # Global statistics are the same five temporal summaries used by the
+        # ML baseline: mean, standard deviation, maximum, minimum, and last.
+        self.stats_branch = nn.Sequential(
+            nn.Linear(num_features * 5, config.DL_CONFIG["fc_hidden"]),
+            nn.LayerNorm(config.DL_CONFIG["fc_hidden"]),
+            nn.SiLU(),
+            nn.Dropout(0.3)
+        )
+
         # Classification Head
         self.classifier = nn.Sequential(
-            nn.Linear(bidirectional_dim, config.DL_CONFIG["fc_hidden"]),
-            nn.BatchNorm1d(config.DL_CONFIG["fc_hidden"]),
+            nn.Linear(bidirectional_dim + config.DL_CONFIG["fc_hidden"], config.DL_CONFIG["fc_hidden"]),
+            nn.LayerNorm(config.DL_CONFIG["fc_hidden"]),
             nn.SiLU(),
             nn.Dropout(0.4),
             nn.Linear(config.DL_CONFIG["fc_hidden"], num_classes)
@@ -98,7 +108,7 @@ class SolarFlareCNNLSTM(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, nn.BatchNorm1d):
+            elif isinstance(m, (nn.BatchNorm1d, nn.GroupNorm, nn.LayerNorm)):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
             elif isinstance(m, nn.LSTM):
@@ -112,12 +122,17 @@ class SolarFlareCNNLSTM(nn.Module):
 
     def forward(self, x):
         # x: (Batch, Channels, Seq_Len)
-        x = self.input_bn(x)
+        stats = torch.cat(
+            [x.mean(dim=2), x.std(dim=2), x.amax(dim=2), x.amin(dim=2), x[:, :, -1]],
+            dim=1
+        )
+        x = self.input_norm(x)
         x = self.conv_block(x)          # (Batch, 128, 30)
         x = x.permute(0, 2, 1)          # (Batch, 30, 128)
         lstm_out, _ = self.lstm(x)      # (Batch, 30, 512)
         context = self.attention(lstm_out) # Attention-weighted pooling across all 30 steps
-        logits = self.classifier(context)
+        stats_embedding = self.stats_branch(stats)
+        logits = self.classifier(torch.cat([context, stats_embedding], dim=1))
         return logits
 
 
